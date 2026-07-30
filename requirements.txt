@@ -1,2 +1,2 @@
-python-telegram-bot==20.7
-requests
+# Dependencias instaladas via uv en el build command
+# Ver [deployment] en .replit
