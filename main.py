@@ -1,7 +1,6 @@
 import os
 import logging
 import requests
-from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -9,6 +8,8 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_ME")
 TOKEN_ADDRESS = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
 WHALE_THRESHOLD = 5_500  # USD
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else None
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,37 +23,6 @@ seen_signatures: set[str] = set()
 pair_address: str | None = None
 
 
-# ── Formatting helpers ───────────────────────────────────────────────────────
-
-def fmt(value: float) -> str:
-    """Format a USD number with M/K suffix."""
-    v = float(value or 0)
-    if v >= 1_000_000:
-        return f"${v / 1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"${v / 1_000:.1f}K"
-    return f"${v:.2f}"
-
-
-def fmt_pct(value: float) -> str:
-    emoji = "🟢" if value >= 0 else "🔴"
-    sign  = "+" if value >= 0 else ""
-    return f"{emoji} `{sign}{value:.2f}%`"
-
-
-def pair_age(created_at_ms: int) -> str:
-    """Return human-readable age from a Unix-ms timestamp."""
-    delta = datetime.now(timezone.utc) - datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
-    days  = delta.days
-    if days >= 30:
-        return f"{days // 30}m {days % 30}d"
-    if days >= 1:
-        return f"{days}d {delta.seconds // 3600}h"
-    hours = delta.seconds // 3600
-    mins  = (delta.seconds % 3600) // 60
-    return f"{hours}h {mins}m"
-
-
 # ── DexScreener helpers ──────────────────────────────────────────────────────
 def get_pair_info() -> dict | None:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{TOKEN_ADDRESS}"
@@ -60,7 +30,6 @@ def get_pair_info() -> dict | None:
         r = requests.get(url, timeout=10)
         data = r.json()
         if data.get("pairs"):
-            # Elegimos el par con mayor liquidez
             return max(data["pairs"], key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
     except Exception as e:
         logger.error(f"get_pair_info error: {e}")
@@ -89,6 +58,33 @@ def resolve_pair_address() -> str | None:
         pair_address = pair.get("pairAddress")
         logger.info(f"Pair address resolved: {pair_address}")
     return pair_address
+
+
+# ── Helius holders ───────────────────────────────────────────────────────────
+def get_holder_count() -> int | None:
+    """Obtiene el número de holders usando Helius DAS"""
+    if not HELIUS_RPC:
+        return None
+
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "getTokenAccounts",
+            "params": {
+                "mint": TOKEN_ADDRESS,
+                "limit": 1,
+                "page": 1
+            }
+        }
+        r = requests.post(HELIUS_RPC, json=payload, timeout=12)
+        data = r.json()
+        result = data.get("result")
+        if result and "total" in result:
+            return result["total"]
+    except Exception as e:
+        logger.error(f"Error obteniendo holders: {e}")
+    return None
 
 
 # ── Solana RPC helpers ───────────────────────────────────────────────────────
@@ -213,9 +209,7 @@ async def whale_job(context) -> None:
         )
 
         keyboard = [
-            [
-                InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack"),
-            ],
+            [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
             [
                 InlineKeyboardButton("🔍 Ver TX", url=solscan_tx),
                 InlineKeyboardButton("👛 Wallet", url=solscan_wallet),
@@ -252,7 +246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tracker en tiempo real de *$ANSEM*\n\n"
         "Comandos disponibles:\n"
         "• /price — Precio y métricas\n"
-        "• /stats — Métricas completas\n"
+        "• /stats — Métricas completas + holders\n"
         "• /alerts on — Activar alertas de ballenas\n"
         "• /alerts off — Desactivar alertas\n"
         "• /help — Ayuda\n\n"
@@ -275,10 +269,10 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"🐂 *$ANSEM* — The Black Bull\n\n"
         f"💰 Precio: `${data['price']:.6f}`\n"
-        f"📊 Market Cap: `{fmt(data['mcap'])}`\n"
+        f"📊 Market Cap: `${data['mcap']:,.0f}`\n"
         f"{change_emoji} 24h: `{change:+.2f}%`\n"
-        f"💧 Liquidez: `{fmt(data['liquidity'])}`\n"
-        f"📦 Volumen 24h: `{fmt(data['volume'])}`\n\n"
+        f"💧 Liquidez: `${data['liquidity']:,.0f}`\n"
+        f"📦 Volumen 24h: `${data['volume']:,.0f}`\n\n"
         f"🕐 Actualizado ahora"
     )
 
@@ -300,59 +294,26 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pair = get_pair_info()
-    if not pair:
-        await update.message.reply_text("❌ Error obteniendo datos. Intenta de nuevo en unos segundos.")
+    data = get_ansem_data()
+    if not data:
+        await update.message.reply_text("❌ Error obteniendo datos. Intenta de nuevo.")
         return
 
-    txns     = pair.get("txns", {})
-    changes  = pair.get("priceChange", {})
-    volumes  = pair.get("volume", {})
-    created  = pair.get("pairCreatedAt", 0)
+    holders = get_holder_count()
+    change = data["change_24h"]
+    change_emoji = "🟢" if change >= 0 else "🔴"
 
-    # Buy/sell counts
-    h1_buys  = txns.get("h1",  {}).get("buys",  0)
-    h1_sells = txns.get("h1",  {}).get("sells", 0)
-    h6_buys  = txns.get("h6",  {}).get("buys",  0)
-    h6_sells = txns.get("h6",  {}).get("sells", 0)
-    h24_buys  = txns.get("h24", {}).get("buys",  0)
-    h24_sells = txns.get("h24", {}).get("sells", 0)
-
-    def pressure(buys, sells):
-        total = buys + sells
-        if total == 0:
-            return "—"
-        pct = buys / total * 100
-        bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        return f"{bar} {pct:.0f}% compras"
+    holders_text = f"👥 Holders: `{holders:,}`" if holders else "👥 Holders: `No disponible`"
 
     msg = (
-        f"📊 *$ANSEM — Stats detalladas*\n\n"
-
-        f"*📈 Cambio de precio*\n"
-        f"  5m:  {fmt_pct(changes.get('m5',  0) or 0)}\n"
-        f"  1h:  {fmt_pct(changes.get('h1',  0) or 0)}\n"
-        f"  6h:  {fmt_pct(changes.get('h6',  0) or 0)}\n"
-        f"  24h: {fmt_pct(changes.get('h24', 0) or 0)}\n\n"
-
-        f"*📦 Volumen*\n"
-        f"  1h:  `{fmt(volumes.get('h1',  0))}`\n"
-        f"  6h:  `{fmt(volumes.get('h6',  0))}`\n"
-        f"  24h: `{fmt(volumes.get('h24', 0))}`\n\n"
-
-        f"*🔄 Actividad de trading (1h)*\n"
-        f"  Compras: `{h1_buys}` · Ventas: `{h1_sells}`\n"
-        f"  {pressure(h1_buys, h1_sells)}\n\n"
-
-        f"*🔄 Actividad de trading (6h)*\n"
-        f"  Compras: `{h6_buys}` · Ventas: `{h6_sells}`\n"
-        f"  {pressure(h6_buys, h6_sells)}\n\n"
-
-        f"*🔄 Actividad de trading (24h)*\n"
-        f"  Compras: `{h24_buys}` · Ventas: `{h24_sells}`\n"
-        f"  {pressure(h24_buys, h24_sells)}\n\n"
-
-        f"*🕰 Edad del par:* `{pair_age(created) if created else '—'}`"
+        f"🐂 *$ANSEM* — Stats\n\n"
+        f"💰 Precio: `${data['price']:.6f}`\n"
+        f"📊 Market Cap: `${data['mcap']:,.0f}`\n"
+        f"{change_emoji} 24h: `{change:+.2f}%`\n"
+        f"💧 Liquidez: `${data['liquidity']:,.0f}`\n"
+        f"📦 Volumen 24h: `${data['volume']:,.0f}`\n"
+        f"{holders_text}\n\n"
+        f"🕐 Actualizado ahora"
     )
 
     keyboard = [
@@ -362,10 +323,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
         ]
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
         msg,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=reply_markup,
         disable_web_page_preview=True
     )
 
@@ -400,7 +363,8 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐂 *BlackBullRadar* — Tracker de $ANSEM\n\n"
-        "• /price o /stats → Precio + métricas\n"
+        "• /price → Precio + métricas\n"
+        "• /stats → Métricas completas + holders\n"
         f"• /alerts on → Alertas de ballenas (>${WHALE_THRESHOLD:,})\n"
         "• /alerts off → Desactivar alertas\n"
         "• /help → Este mensaje\n\n"
@@ -421,8 +385,8 @@ def main():
 
     app.job_queue.run_repeating(whale_job, interval=60, first=10)
 
-    print("🐂 BlackBullRadar arrancando con monitor de ballenas...")
-    app.run_polling(drop_pending_updates=True)
+    print("🐂 BlackBullRadar arrancando con monitor de ballenas + holders...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
