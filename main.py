@@ -1,20 +1,20 @@
 import os
 import logging
-import asyncio
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import requests
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "8222243632:AAFccOHOGAwKz9GxbpDWA2dov-ddb2C6KWg")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_ME")
 TOKEN_ADDRESS = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
 WHALE_THRESHOLD = 10_000  # USD
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # In-memory state
 subscribed_chats: set[int] = set()
-seen_tx_hashes: set[str] = set()
+seen_signatures: set[str] = set()
 pair_address: str | None = None
 
 
@@ -45,19 +45,7 @@ def get_ansem_data() -> dict | None:
     }
 
 
-def get_recent_trades(pair_addr: str) -> list[dict]:
-    """Return recent trades for a DexScreener pair address."""
-    url = f"https://api.dexscreener.com/latest/dex/trades/{pair_addr}"
-    try:
-        r = requests.get(url, timeout=10)
-        return r.json() if isinstance(r.json(), list) else []
-    except Exception as e:
-        logger.error(f"get_recent_trades error: {e}")
-    return []
-
-
 def resolve_pair_address() -> str | None:
-    """Fetch and cache the pair address for the token."""
     global pair_address
     if pair_address:
         return pair_address
@@ -68,61 +56,131 @@ def resolve_pair_address() -> str | None:
     return pair_address
 
 
-# ── Whale monitor (background task) ─────────────────────────────────────────
+# ── Solana RPC helpers ───────────────────────────────────────────────────────
 
-async def whale_monitor(app: Application) -> None:
-    """Poll for trades and alert subscribed chats on whale activity."""
-    global seen_tx_hashes
+def solana_post(method: str, params: list) -> dict | None:
+    try:
+        r = requests.post(
+            SOLANA_RPC,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=15,
+        )
+        data = r.json()
+        return data.get("result")
+    except Exception as e:
+        logger.error(f"Solana RPC error ({method}): {e}")
+    return None
 
+
+def get_recent_signatures(address: str, limit: int = 25) -> list[dict]:
+    result = solana_post("getSignaturesForAddress", [address, {"limit": limit}])
+    return result or []
+
+
+def get_transaction(sig: str) -> dict | None:
+    return solana_post(
+        "getTransaction",
+        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+    )
+
+
+def parse_whale_trade(tx: dict, current_price: float, pool_owner: str) -> dict | None:
+    """
+    Extract trade info from a Solana transaction.
+    Looks at token balance changes for TOKEN_ADDRESS,
+    excludes the pool account itself, and returns the
+    largest individual trade found.
+    """
+    if not tx:
+        return None
+    meta = tx.get("meta", {})
+    if meta.get("err"):
+        return None  # failed tx
+
+    pre_balances  = {e["accountIndex"]: e for e in meta.get("preTokenBalances",  []) if e.get("mint") == TOKEN_ADDRESS}
+    post_balances = {e["accountIndex"]: e for e in meta.get("postTokenBalances", []) if e.get("mint") == TOKEN_ADDRESS}
+
+    all_indexes = set(pre_balances) | set(post_balances)
+    best = None
+
+    for idx in all_indexes:
+        pre_entry  = pre_balances.get(idx,  {})
+        post_entry = post_balances.get(idx, {})
+
+        owner = (pre_entry or post_entry).get("owner", "")
+        if owner == pool_owner:
+            continue  # skip the pool's own account
+
+        pre_amt  = float((pre_entry.get("uiTokenAmount")  or {}).get("uiAmount") or 0)
+        post_amt = float((post_entry.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        delta    = post_amt - pre_amt  # + = bought, – = sold
+
+        usd_value = abs(delta) * current_price
+        if usd_value < WHALE_THRESHOLD:
+            continue
+
+        if best is None or usd_value > best["usd_value"]:
+            best = {
+                "side":      "BUY" if delta > 0 else "SELL",
+                "tokens":    abs(delta),
+                "usd_value": usd_value,
+                "price":     current_price,
+                "wallet":    owner,
+            }
+
+    return best
+
+
+# ── Whale monitor (background job) ──────────────────────────────────────────
+
+async def whale_job(context) -> None:
     addr = resolve_pair_address()
     if not addr:
-        logger.warning("whale_monitor: pair address not resolved yet")
+        logger.warning("whale_job: pair address not resolved")
         return
 
-    trades = get_recent_trades(addr)
-    if not trades:
+    # Get current price for USD conversion
+    data = get_ansem_data()
+    if not data or data["price"] == 0:
         return
+    current_price = data["price"]
 
+    sigs = get_recent_signatures(addr, limit=25)
     new_whales = []
-    for trade in trades:
-        tx_hash = trade.get("txHash") or trade.get("id", "")
-        if not tx_hash or tx_hash in seen_tx_hashes:
+
+    for entry in sigs:
+        sig = entry.get("signature", "")
+        if not sig or sig in seen_signatures:
             continue
-        seen_tx_hashes.add(tx_hash)
+        seen_signatures.add(sig)
 
-        amount_usd = float(trade.get("amountUsd", 0) or 0)
-        if amount_usd < WHALE_THRESHOLD:
-            continue
+        if entry.get("err"):
+            continue  # skip failed txs
 
-        side = trade.get("type", "").upper()  # "buy" / "sell"
-        emoji = "🟢" if side == "BUY" else "🔴"
-        price = float(trade.get("priceUsd", 0) or 0)
-        token_amount = float(trade.get("amount", 0) or 0)
-
-        new_whales.append({
-            "emoji": emoji,
-            "side": side,
-            "amount_usd": amount_usd,
-            "token_amount": token_amount,
-            "price": price,
-            "tx": tx_hash,
-        })
+        tx = get_transaction(sig)
+        whale = parse_whale_trade(tx, current_price, pool_owner=addr)
+        if whale:
+            whale["sig"] = sig
+            new_whales.append(whale)
 
     if not new_whales or not subscribed_chats:
         return
 
     for whale in new_whales:
-        short_tx = whale["tx"][:12] + "…" if len(whale["tx"]) > 12 else whale["tx"]
+        emoji = "🟢" if whale["side"] == "BUY" else "🔴"
+        short_sig = whale["sig"][:12] + "…"
+        short_wallet = whale["wallet"][:8] + "…" + whale["wallet"][-4:]
         msg = (
-            f"{whale['emoji']} *Whale Alert — ${whale['amount_usd']:,.0f}*\n\n"
+            f"{emoji} *Whale Alert — ${whale['usd_value']:,.0f}*\n\n"
             f"Tipo: `{whale['side']}`\n"
-            f"Tokens: `{whale['token_amount']:,.2f} $ANSEM`\n"
+            f"Tokens: `{whale['tokens']:,.2f} $ANSEM`\n"
             f"Precio: `${whale['price']:.6f}`\n"
-            f"TX: `{short_tx}`"
+            f"Wallet: `{short_wallet}`\n"
+            f"TX: `{short_sig}`"
         )
         for chat_id in list(subscribed_chats):
             try:
-                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Error sending whale alert to {chat_id}: {e}")
 
@@ -138,7 +196,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alerts on — activar alertas de ballenas 🐋\n"
         "/alerts off — desactivar alertas\n"
         "/help — ayuda",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 
@@ -169,7 +227,7 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args or args[0].lower() not in ("on", "off"):
         status = "✅ activas" if chat_id in subscribed_chats else "❌ inactivas"
         await update.message.reply_text(
-            f"Alertas de ballenas (>{WHALE_THRESHOLD:,} USD): {status}\n\n"
+            f"Alertas de ballenas (>${WHALE_THRESHOLD:,} USD): {status}\n\n"
             "Usa /alerts on para activar\n"
             "Usa /alerts off para desactivar"
         )
@@ -192,21 +250,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/price o /stats — datos actuales\n"
         "/alerts on — recibir alertas de ballenas (>$10,000)\n"
         "/alerts off — dejar de recibir alertas",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
-
-
-# ── Periodic job wrapper ─────────────────────────────────────────────────────
-
-async def whale_job(context: ContextTypes.DEFAULT_TYPE):
-    await whale_monitor(context.application)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("price",  price))
     app.add_handler(CommandHandler("stats",  stats))
@@ -214,10 +265,9 @@ def main():
     app.add_handler(CommandHandler("help",   help_command))
 
     # Poll for whale trades every 60 seconds
-    job_queue = app.job_queue
-    job_queue.run_repeating(whale_job, interval=60, first=10)
+    app.job_queue.run_repeating(whale_job, interval=60, first=10)
 
-    print("BlackBullRadar arrancando con monitor de ballenas...")
+    print("BlackBullRadar arrancando con monitor de ballenas (Solana RPC)...")
     app.run_polling()
 
 
