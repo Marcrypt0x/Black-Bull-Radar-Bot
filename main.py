@@ -8,8 +8,6 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_ME")
 TOKEN_ADDRESS = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
 WHALE_THRESHOLD = 5500
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
-HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
-HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else None
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +15,15 @@ logger = logging.getLogger(__name__)
 subscribed_chats = set()
 seen_signatures = set()
 pair_address = None
+
+
+def fmt(n):
+    """Formatea números grandes de forma legible"""
+    if n >= 1_000_000:
+        return f"${n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"${n/1_000:.1f}K"
+    return f"${n:,.0f}"
 
 
 def get_pair_info():
@@ -35,17 +42,12 @@ def get_ansem_data():
     pair = get_pair_info()
     if not pair:
         return None
-    price = float(pair.get("priceUsd", 0))
-    mcap = pair.get("marketCap") or pair.get("fdv") or 0
-    volume = pair.get("volume", {}).get("h24", 0) or 0
-    liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
-    change_24h = pair.get("priceChange", {}).get("h24", 0) or 0
     return {
-        "price": price,
-        "mcap": mcap,
-        "volume": volume,
-        "liquidity": liquidity,
-        "change_24h": change_24h
+        "price": float(pair.get("priceUsd", 0)),
+        "mcap": pair.get("marketCap") or pair.get("fdv") or 0,
+        "volume": pair.get("volume", {}).get("h24", 0) or 0,
+        "liquidity": pair.get("liquidity", {}).get("usd", 0) or 0,
+        "change_24h": pair.get("priceChange", {}).get("h24", 0) or 0,
     }
 
 
@@ -58,30 +60,6 @@ def resolve_pair_address():
         pair_address = pair.get("pairAddress")
         logger.info(f"Pair address resolved: {pair_address}")
     return pair_address
-
-
-def get_holder_count():
-    if not HELIUS_RPC:
-        return None
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "holders",
-            "method": "getTokenAccounts",
-            "params": {
-                "mint": TOKEN_ADDRESS,
-                "limit": 1,
-                "page": 1
-            }
-        }
-        r = requests.post(HELIUS_RPC, json=payload, timeout=12)
-        data = r.json()
-        result = data.get("result")
-        if result and "total" in result:
-            return int(result["total"])
-    except Exception as e:
-        logger.error(f"Error holders: {e}")
-    return None
 
 
 def solana_post(method, params):
@@ -203,12 +181,11 @@ async def start(update, context):
         "🐂 *BlackBullRadar*\n"
         "Tracker en tiempo real de *$ANSEM*\n\n"
         "Comandos:\n"
-        "• /price\n"
-        "• /stats\n"
-        "• /alerts on\n"
-        "• /alerts off\n"
-        "• /help\n\n"
-        "💡 Usa los botones para operar rápido.",
+        "• /price — Precio y métricas\n"
+        "• /stats — Métricas detalladas\n"
+        "• /alerts on — Activar alertas de ballenas\n"
+        "• /alerts off — Desactivar alertas\n"
+        "• /help — Ayuda",
         parse_mode="Markdown",
         reply_markup=reply_markup,
         disable_web_page_preview=True
@@ -223,13 +200,6 @@ async def price(update, context):
 
     change = data["change_24h"]
     change_emoji = "🟢" if change >= 0 else "🔴"
-
-    def fmt(n):
-        if n >= 1_000_000:
-            return f"${n/1_000_000:.2f}M"
-        if n >= 1_000:
-            return f"${n/1_000:.1f}K"
-        return f"${n:,.0f}"
 
     msg = (
         f"🐂 *$ANSEM* — The Black Bull\n\n"
@@ -257,23 +227,15 @@ async def price(update, context):
 
 
 async def stats(update, context):
+    # Por ahora /stats muestra lo mismo que /price pero con título diferente
+    # (podemos ampliarlo después con más datos de DexScreener)
     data = get_ansem_data()
     if not data:
         await update.message.reply_text("❌ Error obteniendo datos.")
         return
 
-    holders = get_holder_count()
     change = data["change_24h"]
     change_emoji = "🟢" if change >= 0 else "🔴"
-
-    def fmt(n):
-        if n >= 1_000_000:
-            return f"${n/1_000_000:.2f}M"
-        if n >= 1_000:
-            return f"${n/1_000:.1f}K"
-        return f"${n:,.0f}"
-
-    holders_text = f"👥 Holders: {holders:,}" if holders else "👥 Holders: No disponible"
 
     msg = (
         f"🐂 *$ANSEM* — Stats\n\n"
@@ -281,8 +243,7 @@ async def stats(update, context):
         f"📊 Market Cap: {fmt(data['mcap'])}\n"
         f"{change_emoji} 24h: {change:+.2f}%\n"
         f"💧 Liquidez: {fmt(data['liquidity'])}\n"
-        f"📦 Volumen 24h: {fmt(data['volume'])}\n"
-        f"{holders_text}\n\n"
+        f"📦 Volumen 24h: {fmt(data['volume'])}\n\n"
         f"🕐 Actualizado ahora"
     )
 
@@ -319,8 +280,8 @@ async def alerts(update, context):
 async def help_command(update, context):
     await update.message.reply_text(
         "🐂 *BlackBullRadar*\n\n"
-        "/price → Precio\n"
-        "/stats → Stats + holders\n"
+        "/price → Precio y métricas\n"
+        "/stats → Stats\n"
         f"/alerts on → Ballenas > ${WHALE_THRESHOLD:,}\n"
         "/alerts off → Desactivar\n"
         "/help → Ayuda",
