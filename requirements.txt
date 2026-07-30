@@ -1,2 +1,2 @@
-# Dependencias instaladas via uv en el build command
-# Ver [deployment] en .replit
+python-telegram-bot[job-queue]
+requests
