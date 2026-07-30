@@ -29,3 +29,4 @@ args = ".venv/bin/python main.py"
 [deployment]
 deploymentTarget = "vm"
 run = [".venv/bin/python", "main.py"]
+build = ["bash", "-c", "uv venv --clear .venv && uv pip install --python .venv 'python-telegram-bot[job-queue]' requests"]
