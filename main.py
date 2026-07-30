@@ -63,45 +63,25 @@ def resolve_pair_address():
 def get_holder_count():
     if not HELIUS_RPC:
         return None
-    total_holders = 0
-    page = 1
-    limit = 1000
     try:
-        while True:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": f"holders-{page}",
-                "method": "getTokenAccounts",
-                "params": {
-                    "mint": TOKEN_ADDRESS,
-                    "limit": limit,
-                    "page": page
-                }
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "holders",
+            "method": "getTokenAccounts",
+            "params": {
+                "mint": TOKEN_ADDRESS,
+                "limit": 1,
+                "page": 1
             }
-            r = requests.post(HELIUS_RPC, json=payload, timeout=20)
-            data = r.json()
-            if "error" in data:
-                logger.error(f"Helius error page {page}: {data['error']}")
-                break
-            result = data.get("result")
-            if not result:
-                break
-            if "total" in result and page == 1:
-                return int(result["total"])
-            token_accounts = result.get("token_accounts") or result.get("tokenAccounts") or []
-            count = len(token_accounts)
-            if count == 0:
-                break
-            total_holders += count
-            if count < limit:
-                break
-            page += 1
-            if page > 20:
-                break
-        return total_holders if total_holders > 0 else None
+        }
+        r = requests.post(HELIUS_RPC, json=payload, timeout=12)
+        data = r.json()
+        result = data.get("result")
+        if result and "total" in result:
+            return int(result["total"])
     except Exception as e:
         logger.error(f"Error holders: {e}")
-        return None
+    return None
 
 
 def solana_post(method, params):
@@ -119,4 +99,246 @@ def get_recent_signatures(address, limit=25):
 
 
 def get_transaction(sig):
-    return solana_post
+    return solana_post("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+
+
+def parse_whale_trade(tx, current_price, pool_owner):
+    if not tx:
+        return None
+    meta = tx.get("meta", {})
+    if meta.get("err"):
+        return None
+    pre_balances = {e["accountIndex"]: e for e in meta.get("preTokenBalances", []) if e.get("mint") == TOKEN_ADDRESS}
+    post_balances = {e["accountIndex"]: e for e in meta.get("postTokenBalances", []) if e.get("mint") == TOKEN_ADDRESS}
+    all_indexes = set(pre_balances) | set(post_balances)
+    best = None
+    for idx in all_indexes:
+        pre_entry = pre_balances.get(idx, {})
+        post_entry = post_balances.get(idx, {})
+        owner = (pre_entry or post_entry).get("owner", "")
+        if owner == pool_owner:
+            continue
+        pre_amt = float((pre_entry.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        post_amt = float((post_entry.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        delta = post_amt - pre_amt
+        usd_value = abs(delta) * current_price
+        if usd_value < WHALE_THRESHOLD:
+            continue
+        if best is None or usd_value > best["usd_value"]:
+            best = {
+                "side": "BUY" if delta > 0 else "SELL",
+                "tokens": abs(delta),
+                "usd_value": usd_value,
+                "price": current_price,
+                "wallet": owner
+            }
+    return best
+
+
+async def whale_job(context):
+    addr = resolve_pair_address()
+    if not addr:
+        return
+    data = get_ansem_data()
+    if not data or data["price"] == 0:
+        return
+    current_price = data["price"]
+    sigs = get_recent_signatures(addr, limit=25)
+    new_whales = []
+    for entry in sigs:
+        sig = entry.get("signature", "")
+        if not sig or sig in seen_signatures:
+            continue
+        seen_signatures.add(sig)
+        if entry.get("err"):
+            continue
+        tx = get_transaction(sig)
+        whale = parse_whale_trade(tx, current_price, pool_owner=addr)
+        if whale:
+            whale["sig"] = sig
+            new_whales.append(whale)
+    if not new_whales or not subscribed_chats:
+        return
+    for whale in new_whales:
+        emoji = "🟢 COMPRA" if whale["side"] == "BUY" else "🔴 VENTA"
+        short_wallet = whale["wallet"][:6] + "..." + whale["wallet"][-4:]
+        solscan_tx = f"https://solscan.io/tx/{whale['sig']}"
+        solscan_wallet = f"https://solscan.io/account/{whale['wallet']}"
+        msg = (
+            f"🐋 *Whale Alert*\n\n"
+            f"{emoji}\n"
+            f"💵 Valor: *${whale['usd_value']:,.0f}*\n"
+            f"🪙 Tokens: {whale['tokens']:,.2f} $ANSEM\n"
+            f"💰 Precio: ${whale['price']:.6f}\n"
+            f"👛 Wallet: {short_wallet}\n"
+        )
+        keyboard = [
+            [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
+            [InlineKeyboardButton("🔍 Ver TX", url=solscan_tx), InlineKeyboardButton("👛 Wallet", url=solscan_wallet)]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        for chat_id in list(subscribed_chats):
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.error(f"Error sending whale alert: {e}")
+
+
+async def start(update, context):
+    keyboard = [
+        [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
+        [
+            InlineKeyboardButton("📈 DexScreener", url=f"https://dexscreener.com/solana/{TOKEN_ADDRESS}"),
+            InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🐂 *BlackBullRadar*\n"
+        "Tracker en tiempo real de *$ANSEM*\n\n"
+        "Comandos:\n"
+        "• /price\n"
+        "• /stats\n"
+        "• /alerts on\n"
+        "• /alerts off\n"
+        "• /help\n\n"
+        "💡 Usa los botones para operar rápido.",
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+
+async def price(update, context):
+    data = get_ansem_data()
+    if not data:
+        await update.message.reply_text("❌ Error obteniendo datos.")
+        return
+
+    change = data["change_24h"]
+    change_emoji = "🟢" if change >= 0 else "🔴"
+
+    def fmt(n):
+        if n >= 1_000_000:
+            return f"${n/1_000_000:.2f}M"
+        if n >= 1_000:
+            return f"${n/1_000:.1f}K"
+        return f"${n:,.0f}"
+
+    msg = (
+        f"🐂 *$ANSEM* — The Black Bull\n\n"
+        f"💰 Precio: ${data['price']:.6f}\n"
+        f"📊 Market Cap: {fmt(data['mcap'])}\n"
+        f"{change_emoji} 24h: {change:+.2f}%\n"
+        f"💧 Liquidez: {fmt(data['liquidity'])}\n"
+        f"📦 Volumen 24h: {fmt(data['volume'])}\n\n"
+        f"🕐 Actualizado ahora"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
+        [
+            InlineKeyboardButton("📈 DexScreener", url=f"https://dexscreener.com/solana/{TOKEN_ADDRESS}"),
+            InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
+        ]
+    ]
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
+
+
+async def stats(update, context):
+    data = get_ansem_data()
+    if not data:
+        await update.message.reply_text("❌ Error obteniendo datos.")
+        return
+
+    holders = get_holder_count()
+    change = data["change_24h"]
+    change_emoji = "🟢" if change >= 0 else "🔴"
+
+    def fmt(n):
+        if n >= 1_000_000:
+            return f"${n/1_000_000:.2f}M"
+        if n >= 1_000:
+            return f"${n/1_000:.1f}K"
+        return f"${n:,.0f}"
+
+    holders_text = f"👥 Holders: {holders:,}" if holders else "👥 Holders: No disponible"
+
+    msg = (
+        f"🐂 *$ANSEM* — Stats\n\n"
+        f"💰 Precio: ${data['price']:.6f}\n"
+        f"📊 Market Cap: {fmt(data['mcap'])}\n"
+        f"{change_emoji} 24h: {change:+.2f}%\n"
+        f"💧 Liquidez: {fmt(data['liquidity'])}\n"
+        f"📦 Volumen 24h: {fmt(data['volume'])}\n"
+        f"{holders_text}\n\n"
+        f"🕐 Actualizado ahora"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
+        [
+            InlineKeyboardButton("📈 DexScreener", url=f"https://dexscreener.com/solana/{TOKEN_ADDRESS}"),
+            InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
+        ]
+    ]
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
+
+
+async def alerts(update, context):
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args or args[0].lower() not in ("on", "off"):
+        status = "✅ activas" if chat_id in subscribed_chats else "❌ inactivas"
+        await update.message.reply_text(f"🐋 Alertas (>${WHALE_THRESHOLD:,}): {status}\n\n/alerts on\n/alerts off")
+        return
+    if args[0].lower() == "on":
+        subscribed_chats.add(chat_id)
+        await update.message.reply_text(f"🐋 Alertas activadas ( > ${WHALE_THRESHOLD:,} )")
+    else:
+        subscribed_chats.discard(chat_id)
+        await update.message.reply_text("🔕 Alertas desactivadas.")
+
+
+async def help_command(update, context):
+    await update.message.reply_text(
+        "🐂 *BlackBullRadar*\n\n"
+        "/price → Precio\n"
+        "/stats → Stats + holders\n"
+        f"/alerts on → Ballenas > ${WHALE_THRESHOLD:,}\n"
+        "/alerts off → Desactivar\n"
+        "/help → Ayuda",
+        parse_mode="Markdown"
+    )
+
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("alerts", alerts))
+    app.add_handler(CommandHandler("help", help_command))
+    app.job_queue.run_repeating(whale_job, interval=60, first=10)
+    print("🐂 BlackBullRadar arrancando...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
