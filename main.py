@@ -299,22 +299,44 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error obteniendo datos. Intenta de nuevo.")
         return
 
-    holders = get_holder_count()
-    change = data["change_24h"]
-    change_emoji = "🟢" if change >= 0 else "🔴"
+    def get_holder_count() -> int | None:
+    """Obtiene el número de holders usando Helius DAS"""
+    if not HELIUS_RPC:
+        return None
 
-    holders_text = f"👥 Holders: `{holders:,}`" if holders else "👥 Holders: `No disponible`"
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "helius-holders",
+            "method": "getTokenAccounts",
+            "params": {
+                "mint": TOKEN_ADDRESS,
+                "limit": 1000,   # pedimos más para forzar el total real
+                "page": 1
+            }
+        }
+        r = requests.post(HELIUS_RPC, json=payload, timeout=15)
+        data = r.json()
 
-    msg = (
-        f"🐂 *$ANSEM* — Stats\n\n"
-        f"💰 Precio: `${data['price']:.6f}`\n"
-        f"📊 Market Cap: `${data['mcap']:,.0f}`\n"
-        f"{change_emoji} 24h: `{change:+.2f}%`\n"
-        f"💧 Liquidez: `${data['liquidity']:,.0f}`\n"
-        f"📦 Volumen 24h: `${data['volume']:,.0f}`\n"
-        f"{holders_text}\n\n"
-        f"🕐 Actualizado ahora"
-    )
+        result = data.get("result")
+        if not result:
+            logger.warning(f"Helius response sin result: {data}")
+            return None
+
+        # Intentamos varias formas de sacar el total
+        total = result.get("total")
+        if total is not None:
+            return int(total)
+
+        # Fallback: contar los token_accounts que devolvió
+        token_accounts = result.get("token_accounts") or result.get("tokenAccounts") or []
+        if token_accounts:
+            return len(token_accounts)
+
+    except Exception as e:
+        logger.error(f"Error obteniendo holders: {e}")
+    
+    return None
 
     keyboard = [
         [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
