@@ -25,3 +25,7 @@ outputType = "console"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = ".venv/bin/python main.py"
+
+[deployment]
+deploymentTarget = "vm"
+run = [".venv/bin/python", "main.py"]
