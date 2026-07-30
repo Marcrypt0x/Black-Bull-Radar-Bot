@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_ME")
 TOKEN_ADDRESS = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
-WHALE_THRESHOLD = 10_000  # USD
+WHALE_THRESHOLD = 5_500  # USD
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
