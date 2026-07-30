@@ -18,7 +18,6 @@ pair_address = None
 
 
 def fmt(n):
-    """Formatea números grandes de forma legible"""
     if n >= 1_000_000:
         return f"${n/1_000_000:.2f}M"
     if n >= 1_000:
@@ -42,12 +41,28 @@ def get_ansem_data():
     pair = get_pair_info()
     if not pair:
         return None
+
+    price_change = pair.get("priceChange", {}) or {}
+    volume = pair.get("volume", {}) or {}
+    txns = pair.get("txns", {}) or {}
+
     return {
         "price": float(pair.get("priceUsd", 0)),
         "mcap": pair.get("marketCap") or pair.get("fdv") or 0,
-        "volume": pair.get("volume", {}).get("h24", 0) or 0,
         "liquidity": pair.get("liquidity", {}).get("usd", 0) or 0,
-        "change_24h": pair.get("priceChange", {}).get("h24", 0) or 0,
+        "change_m5": price_change.get("m5", 0) or 0,
+        "change_h1": price_change.get("h1", 0) or 0,
+        "change_h6": price_change.get("h6", 0) or 0,
+        "change_h24": price_change.get("h24", 0) or 0,
+        "volume_h1": volume.get("h1", 0) or 0,
+        "volume_h6": volume.get("h6", 0) or 0,
+        "volume_h24": volume.get("h24", 0) or 0,
+        "buys_h1": (txns.get("h1") or {}).get("buys", 0) or 0,
+        "sells_h1": (txns.get("h1") or {}).get("sells", 0) or 0,
+        "buys_h6": (txns.get("h6") or {}).get("buys", 0) or 0,
+        "sells_h6": (txns.get("h6") or {}).get("sells", 0) or 0,
+        "buys_h24": (txns.get("h24") or {}).get("buys", 0) or 0,
+        "sells_h24": (txns.get("h24") or {}).get("sells", 0) or 0,
     }
 
 
@@ -181,8 +196,8 @@ async def start(update, context):
         "🐂 *BlackBullRadar*\n"
         "Tracker en tiempo real de *$ANSEM*\n\n"
         "Comandos:\n"
-        "• /price — Precio y métricas\n"
-        "• /stats — Métricas detalladas\n"
+        "• /price — Vista rápida\n"
+        "• /stats — Stats detalladas\n"
         "• /alerts on — Activar alertas de ballenas\n"
         "• /alerts off — Desactivar alertas\n"
         "• /help — Ayuda",
@@ -198,7 +213,7 @@ async def price(update, context):
         await update.message.reply_text("❌ Error obteniendo datos.")
         return
 
-    change = data["change_24h"]
+    change = data["change_h24"]
     change_emoji = "🟢" if change >= 0 else "🔴"
 
     msg = (
@@ -207,7 +222,7 @@ async def price(update, context):
         f"📊 Market Cap: {fmt(data['mcap'])}\n"
         f"{change_emoji} 24h: {change:+.2f}%\n"
         f"💧 Liquidez: {fmt(data['liquidity'])}\n"
-        f"📦 Volumen 24h: {fmt(data['volume'])}\n\n"
+        f"📦 Volumen 24h: {fmt(data['volume_h24'])}\n\n"
         f"🕐 Actualizado ahora"
     )
 
@@ -227,24 +242,35 @@ async def price(update, context):
 
 
 async def stats(update, context):
-    # Por ahora /stats muestra lo mismo que /price pero con título diferente
-    # (podemos ampliarlo después con más datos de DexScreener)
     data = get_ansem_data()
     if not data:
         await update.message.reply_text("❌ Error obteniendo datos.")
         return
 
-    change = data["change_24h"]
-    change_emoji = "🟢" if change >= 0 else "🔴"
+    def change_emoji(val):
+        return "🟢" if val >= 0 else "🔴"
+
+    def pct(val):
+        return f"{val:+.2f}%"
 
     msg = (
-        f"🐂 *$ANSEM* — Stats\n\n"
+        f"🐂 *$ANSEM* — Stats detalladas\n\n"
         f"💰 Precio: ${data['price']:.6f}\n"
         f"📊 Market Cap: {fmt(data['mcap'])}\n"
-        f"{change_emoji} 24h: {change:+.2f}%\n"
-        f"💧 Liquidez: {fmt(data['liquidity'])}\n"
-        f"📦 Volumen 24h: {fmt(data['volume'])}\n\n"
-        f"🕐 Actualizado ahora"
+        f"💧 Liquidez: {fmt(data['liquidity'])}\n\n"
+        f"📈 *Cambio de precio*\n"
+        f"5m: {change_emoji(data['change_m5'])} {pct(data['change_m5'])}\n"
+        f"1h: {change_emoji(data['change_h1'])} {pct(data['change_h1'])}\n"
+        f"6h: {change_emoji(data['change_h6'])} {pct(data['change_h6'])}\n"
+        f"24h: {change_emoji(data['change_h24'])} {pct(data['change_h24'])}\n\n"
+        f"📦 *Volumen*\n"
+        f"1h: {fmt(data['volume_h1'])}\n"
+        f"6h: {fmt(data['volume_h6'])}\n"
+        f"24h: {fmt(data['volume_h24'])}\n\n"
+        f"🔄 *Actividad de trading*\n"
+        f"1h → Compras: {data['buys_h1']} · Ventas: {data['sells_h1']}\n"
+        f"6h → Compras: {data['buys_h6']} · Ventas: {data['sells_h6']}\n"
+        f"24h → Compras: {data['buys_h24']} · Ventas: {data['sells_h24']}"
     )
 
     keyboard = [
@@ -254,6 +280,7 @@ async def stats(update, context):
             InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
         ]
     ]
+
     await update.message.reply_text(
         msg,
         parse_mode="Markdown",
@@ -280,8 +307,8 @@ async def alerts(update, context):
 async def help_command(update, context):
     await update.message.reply_text(
         "🐂 *BlackBullRadar*\n\n"
-        "/price → Precio y métricas\n"
-        "/stats → Stats\n"
+        "/price → Vista rápida\n"
+        "/stats → Stats detalladas\n"
         f"/alerts on → Ballenas > ${WHALE_THRESHOLD:,}\n"
         "/alerts off → Desactivar\n"
         "/help → Ayuda",
