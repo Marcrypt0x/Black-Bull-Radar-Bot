@@ -69,21 +69,35 @@ def get_holder_count() -> int | None:
     try:
         payload = {
             "jsonrpc": "2.0",
-            "id": "1",
+            "id": "helius-holders",
             "method": "getTokenAccounts",
             "params": {
                 "mint": TOKEN_ADDRESS,
-                "limit": 1,
+                "limit": 1000,
                 "page": 1
             }
         }
-        r = requests.post(HELIUS_RPC, json=payload, timeout=12)
+        r = requests.post(HELIUS_RPC, json=payload, timeout=15)
         data = r.json()
+
         result = data.get("result")
-        if result and "total" in result:
-            return result["total"]
+        if not result:
+            logger.warning(f"Helius response sin result: {data}")
+            return None
+
+        # Intentamos sacar el total
+        total = result.get("total")
+        if total is not None:
+            return int(total)
+
+        # Fallback: contar los token accounts devueltos
+        token_accounts = result.get("token_accounts") or result.get("tokenAccounts") or []
+        if token_accounts:
+            return len(token_accounts)
+
     except Exception as e:
         logger.error(f"Error obteniendo holders: {e}")
+    
     return None
 
 
@@ -270,146 +284,4 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🐂 *$ANSEM* — The Black Bull\n\n"
         f"💰 Precio: `${data['price']:.6f}`\n"
         f"📊 Market Cap: `${data['mcap']:,.0f}`\n"
-        f"{change_emoji} 24h: `{change:+.2f}%`\n"
-        f"💧 Liquidez: `${data['liquidity']:,.0f}`\n"
-        f"📦 Volumen 24h: `${data['volume']:,.0f}`\n\n"
-        f"🕐 Actualizado ahora"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
-        [
-            InlineKeyboardButton("📈 DexScreener", url=f"https://dexscreener.com/solana/{TOKEN_ADDRESS}"),
-            InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        msg,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-        disable_web_page_preview=True
-    )
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = get_ansem_data()
-    if not data:
-        await update.message.reply_text("❌ Error obteniendo datos. Intenta de nuevo.")
-        return
-
-    def get_holder_count() -> int | None:
-    """Obtiene el número de holders usando Helius DAS"""
-    if not HELIUS_RPC:
-        return None
-
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "helius-holders",
-            "method": "getTokenAccounts",
-            "params": {
-                "mint": TOKEN_ADDRESS,
-                "limit": 1000,   # pedimos más para forzar el total real
-                "page": 1
-            }
-        }
-        r = requests.post(HELIUS_RPC, json=payload, timeout=15)
-        data = r.json()
-
-        result = data.get("result")
-        if not result:
-            logger.warning(f"Helius response sin result: {data}")
-            return None
-
-        # Intentamos varias formas de sacar el total
-        total = result.get("total")
-        if total is not None:
-            return int(total)
-
-        # Fallback: contar los token_accounts que devolvió
-        token_accounts = result.get("token_accounts") or result.get("tokenAccounts") or []
-        if token_accounts:
-            return len(token_accounts)
-
-    except Exception as e:
-        logger.error(f"Error obteniendo holders: {e}")
-    
-    return None
-
-    keyboard = [
-        [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
-        [
-            InlineKeyboardButton("📈 DexScreener", url=f"https://dexscreener.com/solana/{TOKEN_ADDRESS}"),
-            InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        msg,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-        disable_web_page_preview=True
-    )
-
-
-async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = context.args
-
-    if not args or args[0].lower() not in ("on", "off"):
-        status = "✅ *activas*" if chat_id in subscribed_chats else "❌ *inactivas*"
-        await update.message.reply_text(
-            f"🐋 Alertas de ballenas (>${WHALE_THRESHOLD:,})\n"
-            f"Estado actual: {status}\n\n"
-            "• `/alerts on` — activar\n"
-            "• `/alerts off` — desactivar",
-            parse_mode="Markdown"
-        )
-        return
-
-    if args[0].lower() == "on":
-        subscribed_chats.add(chat_id)
-        await update.message.reply_text(
-            f"🐋 *Alertas activadas*\n\n"
-            f"Te avisaré cuando haya compras o ventas mayores a *${WHALE_THRESHOLD:,}*.",
-            parse_mode="Markdown"
-        )
-    else:
-        subscribed_chats.discard(chat_id)
-        await update.message.reply_text("🔕 Alertas de ballenas desactivadas.")
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🐂 *BlackBullRadar* — Tracker de $ANSEM\n\n"
-        "• /price → Precio + métricas\n"
-        "• /stats → Métricas completas + holders\n"
-        f"• /alerts on → Alertas de ballenas (>${WHALE_THRESHOLD:,})\n"
-        "• /alerts off → Desactivar alertas\n"
-        "• /help → Este mensaje\n\n"
-        "Botones de compra prioritarios llevan a *The Bull Pen*.",
-        parse_mode="Markdown"
-    )
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("alerts", alerts))
-    app.add_handler(CommandHandler("help", help_command))
-
-    app.job_queue.run_repeating(whale_job, interval=60, first=10)
-
-    print("🐂 BlackBullRadar arrancando con monitor de ballenas + holders...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        f"{change_emoji} 24h: `{change:+.2f}%`\n
