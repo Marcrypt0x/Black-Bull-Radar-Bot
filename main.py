@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -7,7 +8,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_ME")
 TOKEN_ADDRESS = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
 WHALE_THRESHOLD = 5500
-VOLUME_MULTIPLIER = 2.5  # Alerta si volumen 1h >= 2.5x el promedio
+VOLUME_MULTIPLIER = 2.5
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 subscribed_chats = set()
 seen_signatures = set()
 pair_address = None
-last_volume_alert = 0  # para no spamear alertas de volumen
+last_volume_alert = 0
 
 
 def fmt(n):
@@ -28,30 +29,41 @@ def fmt(n):
 
 
 def get_pair_info():
+    """Devuelve todos los pairs del token"""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{TOKEN_ADDRESS}"
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
-        if data.get("pairs"):
-            return max(data["pairs"], key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+        pairs = data.get("pairs")
+        if pairs:
+            return pairs
     except Exception as e:
         logger.error(f"get_pair_info error: {e}")
     return None
 
 
 def get_ansem_data():
-    pair = get_pair_info()
-    if not pair:
+    pairs = get_pair_info()
+    if not pairs:
         return None
 
-    price_change = pair.get("priceChange", {}) or {}
-    volume = pair.get("volume", {}) or {}
-    txns = pair.get("txns", {}) or {}
+    # Pair principal (mayor liquidez) para precio, cambios y volumen
+    main_pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+
+    price_change = main_pair.get("priceChange", {}) or {}
+    volume = main_pair.get("volume", {}) or {}
+    txns = main_pair.get("txns", {}) or {}
+
+    # Liquidez total = suma de todos los pairs
+    total_liquidity = sum(
+        (p.get("liquidity", {}) or {}).get("usd", 0) or 0
+        for p in pairs
+    )
 
     return {
-        "price": float(pair.get("priceUsd", 0)),
-        "mcap": pair.get("marketCap") or pair.get("fdv") or 0,
-        "liquidity": pair.get("liquidity", {}).get("usd", 0) or 0,
+        "price": float(main_pair.get("priceUsd", 0)),
+        "mcap": main_pair.get("marketCap") or main_pair.get("fdv") or 0,
+        "liquidity": total_liquidity,
         "change_m5": price_change.get("m5", 0) or 0,
         "change_h1": price_change.get("h1", 0) or 0,
         "change_h6": price_change.get("h6", 0) or 0,
@@ -72,16 +84,21 @@ def resolve_pair_address():
     global pair_address
     if pair_address:
         return pair_address
-    pair = get_pair_info()
-    if pair:
-        pair_address = pair.get("pairAddress")
+    pairs = get_pair_info()
+    if pairs:
+        main_pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+        pair_address = main_pair.get("pairAddress")
         logger.info(f"Pair address resolved: {pair_address}")
     return pair_address
 
 
 def solana_post(method, params):
     try:
-        r = requests.post(SOLANA_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=15)
+        r = requests.post(
+            SOLANA_RPC,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=15,
+        )
         return r.json().get("result")
     except Exception as e:
         logger.error(f"Solana RPC error: {e}")
@@ -94,7 +111,10 @@ def get_recent_signatures(address, limit=25):
 
 
 def get_transaction(sig):
-    return solana_post("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+    return solana_post(
+        "getTransaction",
+        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+    )
 
 
 def parse_whale_trade(tx, current_price, pool_owner):
@@ -103,36 +123,49 @@ def parse_whale_trade(tx, current_price, pool_owner):
     meta = tx.get("meta", {})
     if meta.get("err"):
         return None
-    pre_balances = {e["accountIndex"]: e for e in meta.get("preTokenBalances", []) if e.get("mint") == TOKEN_ADDRESS}
-    post_balances = {e["accountIndex"]: e for e in meta.get("postTokenBalances", []) if e.get("mint") == TOKEN_ADDRESS}
+
+    pre_balances = {
+        e["accountIndex"]: e
+        for e in meta.get("preTokenBalances", [])
+        if e.get("mint") == TOKEN_ADDRESS
+    }
+    post_balances = {
+        e["accountIndex"]: e
+        for e in meta.get("postTokenBalances", [])
+        if e.get("mint") == TOKEN_ADDRESS
+    }
+
     all_indexes = set(pre_balances) | set(post_balances)
     best = None
+
     for idx in all_indexes:
         pre_entry = pre_balances.get(idx, {})
         post_entry = post_balances.get(idx, {})
         owner = (pre_entry or post_entry).get("owner", "")
         if owner == pool_owner:
             continue
+
         pre_amt = float((pre_entry.get("uiTokenAmount") or {}).get("uiAmount") or 0)
         post_amt = float((post_entry.get("uiTokenAmount") or {}).get("uiAmount") or 0)
         delta = post_amt - pre_amt
         usd_value = abs(delta) * current_price
+
         if usd_value < WHALE_THRESHOLD:
             continue
+
         if best is None or usd_value > best["usd_value"]:
             best = {
                 "side": "BUY" if delta > 0 else "SELL",
                 "tokens": abs(delta),
                 "usd_value": usd_value,
                 "price": current_price,
-                "wallet": owner
+                "wallet": owner,
             }
     return best
 
 
 async def whale_job(context):
     global last_volume_alert
-    import time
 
     addr = resolve_pair_address()
     if not addr:
@@ -150,9 +183,8 @@ async def whale_job(context):
     avg_hourly = volume_h24 / 24 if volume_h24 > 0 else 0
 
     if avg_hourly > 0 and volume_h1 >= (avg_hourly * VOLUME_MULTIPLIER):
-        # Evitar spam: solo una alerta de volumen cada 30 minutos
         now = time.time()
-        if now - last_volume_alert > 1800:
+        if now - last_volume_alert > 1800:  # máximo 1 alerta cada 30 min
             last_volume_alert = now
             multiplier = volume_h1 / avg_hourly
 
@@ -185,9 +217,10 @@ async def whale_job(context):
                 except Exception as e:
                     logger.error(f"Error sending volume alert: {e}")
 
-    # ——— Alertas de Ballenas (código existente) ———
+    # ——— Alertas de Ballenas ———
     sigs = get_recent_signatures(addr, limit=25)
     new_whales = []
+
     for entry in sigs:
         sig = entry.get("signature", "")
         if not sig or sig in seen_signatures:
@@ -195,6 +228,7 @@ async def whale_job(context):
         seen_signatures.add(sig)
         if entry.get("err"):
             continue
+
         tx = get_transaction(sig)
         whale = parse_whale_trade(tx, current_price, pool_owner=addr)
         if whale:
@@ -221,7 +255,10 @@ async def whale_job(context):
 
         keyboard = [
             [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
-            [InlineKeyboardButton("🔍 Ver TX", url=solscan_tx), InlineKeyboardButton("👛 Wallet", url=solscan_wallet)]
+            [
+                InlineKeyboardButton("🔍 Ver TX", url=solscan_tx),
+                InlineKeyboardButton("👛 Wallet", url=solscan_wallet)
+            ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -247,6 +284,7 @@ async def start(update, context):
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
         "🐂 *BlackBullRadar*\n"
         "Tracker en tiempo real de *$ANSEM*\n\n"
@@ -276,7 +314,7 @@ async def price(update, context):
         f"💰 Precio: ${data['price']:.6f}\n"
         f"📊 Market Cap: {fmt(data['mcap'])}\n"
         f"{change_emoji} 24h: {change:+.2f}%\n"
-        f"💧 Liquidez: {fmt(data['liquidity'])}\n"
+        f"💧 Liquidez total: {fmt(data['liquidity'])}\n"
         f"📦 Volumen 24h: {fmt(data['volume_h24'])}\n\n"
         f"🕐 Actualizado ahora"
     )
@@ -319,7 +357,7 @@ async def stats(update, context):
         f"🐂 *$ANSEM* — Stats detalladas\n\n"
         f"💰 Precio: ${data['price']:.6f}\n"
         f"📊 Market Cap: {fmt(data['mcap'])}\n"
-        f"💧 Liquidez: {fmt(data['liquidity'])}\n\n"
+        f"💧 Liquidez total: {fmt(data['liquidity'])}\n\n"
         f"📈 *Cambio de precio*\n"
         f"5m: {change_emoji(data['change_m5'])} {pct(data['change_m5'])}\n"
         f"1h: {change_emoji(data['change_h1'])} {pct(data['change_h1'])}\n"
@@ -354,6 +392,7 @@ async def stats(update, context):
 async def alerts(update, context):
     chat_id = update.effective_chat.id
     args = context.args
+
     if not args or args[0].lower() not in ("on", "off"):
         status = "✅ activas" if chat_id in subscribed_chats else "❌ inactivas"
         await update.message.reply_text(
@@ -361,6 +400,7 @@ async def alerts(update, context):
             f"/alerts on\n/alerts off"
         )
         return
+
     if args[0].lower() == "on":
         subscribed_chats.add(chat_id)
         await update.message.reply_text(
@@ -387,12 +427,15 @@ async def help_command(update, context):
 
 def main():
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("alerts", alerts))
     app.add_handler(CommandHandler("help", help_command))
+
     app.job_queue.run_repeating(whale_job, interval=60, first=10)
+
     print("🐂 BlackBullRadar arrancando...")
     app.run_polling()
 
