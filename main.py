@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_ME")
 TOKEN_ADDRESS = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
 WHALE_THRESHOLD = 5500
+VOLUME_MULTIPLIER = 2.5  # Alerta si volumen 1h >= 2.5x el promedio
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 subscribed_chats = set()
 seen_signatures = set()
 pair_address = None
+last_volume_alert = 0  # para no spamear alertas de volumen
 
 
 def fmt(n):
@@ -129,13 +131,61 @@ def parse_whale_trade(tx, current_price, pool_owner):
 
 
 async def whale_job(context):
+    global last_volume_alert
+    import time
+
     addr = resolve_pair_address()
     if not addr:
         return
+
     data = get_ansem_data()
     if not data or data["price"] == 0:
         return
+
     current_price = data["price"]
+
+    # ——— Alerta de Volumen Inusual ———
+    volume_h1 = data["volume_h1"]
+    volume_h24 = data["volume_h24"]
+    avg_hourly = volume_h24 / 24 if volume_h24 > 0 else 0
+
+    if avg_hourly > 0 and volume_h1 >= (avg_hourly * VOLUME_MULTIPLIER):
+        # Evitar spam: solo una alerta de volumen cada 30 minutos
+        now = time.time()
+        if now - last_volume_alert > 1800:
+            last_volume_alert = now
+            multiplier = volume_h1 / avg_hourly
+
+            msg = (
+                f"🚨 *Volumen Inusual Detectado*\n\n"
+                f"📦 Volumen 1h: {fmt(volume_h1)}\n"
+                f"📊 Promedio horario 24h: {fmt(avg_hourly)}\n"
+                f"📈 Multiplicador: *{multiplier:.1f}x*\n\n"
+                f"💰 Precio actual: ${current_price:.6f}"
+            )
+
+            keyboard = [
+                [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
+                [
+                    InlineKeyboardButton("📈 DexScreener", url=f"https://dexscreener.com/solana/{TOKEN_ADDRESS}"),
+                    InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{TOKEN_ADDRESS}?chain=solana")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            for chat_id in list(subscribed_chats):
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg,
+                        parse_mode="Markdown",
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending volume alert: {e}")
+
+    # ——— Alertas de Ballenas (código existente) ———
     sigs = get_recent_signatures(addr, limit=25)
     new_whales = []
     for entry in sigs:
@@ -150,13 +200,16 @@ async def whale_job(context):
         if whale:
             whale["sig"] = sig
             new_whales.append(whale)
+
     if not new_whales or not subscribed_chats:
         return
+
     for whale in new_whales:
         emoji = "🟢 COMPRA" if whale["side"] == "BUY" else "🔴 VENTA"
         short_wallet = whale["wallet"][:6] + "..." + whale["wallet"][-4:]
         solscan_tx = f"https://solscan.io/tx/{whale['sig']}"
         solscan_wallet = f"https://solscan.io/account/{whale['wallet']}"
+
         msg = (
             f"🐋 *Whale Alert*\n\n"
             f"{emoji}\n"
@@ -165,11 +218,13 @@ async def whale_job(context):
             f"💰 Precio: ${whale['price']:.6f}\n"
             f"👛 Wallet: {short_wallet}\n"
         )
+
         keyboard = [
             [InlineKeyboardButton("🐂 The Bull Pen", url="https://bullpen.fi/@Mack")],
             [InlineKeyboardButton("🔍 Ver TX", url=solscan_tx), InlineKeyboardButton("👛 Wallet", url=solscan_wallet)]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
+
         for chat_id in list(subscribed_chats):
             try:
                 await context.bot.send_message(
@@ -198,7 +253,7 @@ async def start(update, context):
         "Comandos:\n"
         "• /price — Vista rápida\n"
         "• /stats — Stats detalladas\n"
-        "• /alerts on — Activar alertas de ballenas\n"
+        "• /alerts on — Activar alertas (ballenas + volumen)\n"
         "• /alerts off — Desactivar alertas\n"
         "• /help — Ayuda",
         parse_mode="Markdown",
@@ -253,6 +308,13 @@ async def stats(update, context):
     def pct(val):
         return f"{val:+.2f}%"
 
+    def buy_ratio(buys, sells):
+        total = buys + sells
+        if total == 0:
+            return "—"
+        ratio = (buys / total) * 100
+        return f"{ratio:.0f}% compras"
+
     msg = (
         f"🐂 *$ANSEM* — Stats detalladas\n\n"
         f"💰 Precio: ${data['price']:.6f}\n"
@@ -268,9 +330,9 @@ async def stats(update, context):
         f"6h: {fmt(data['volume_h6'])}\n"
         f"24h: {fmt(data['volume_h24'])}\n\n"
         f"🔄 *Actividad de trading*\n"
-        f"1h → Compras: {data['buys_h1']} · Ventas: {data['sells_h1']}\n"
-        f"6h → Compras: {data['buys_h6']} · Ventas: {data['sells_h6']}\n"
-        f"24h → Compras: {data['buys_h24']} · Ventas: {data['sells_h24']}"
+        f"1h → {data['buys_h1']} compras / {data['sells_h1']} ventas ({buy_ratio(data['buys_h1'], data['sells_h1'])})\n"
+        f"6h → {data['buys_h6']} compras / {data['sells_h6']} ventas ({buy_ratio(data['buys_h6'], data['sells_h6'])})\n"
+        f"24h → {data['buys_h24']} compras / {data['sells_h24']} ventas ({buy_ratio(data['buys_h24'], data['sells_h24'])})"
     )
 
     keyboard = [
@@ -294,11 +356,18 @@ async def alerts(update, context):
     args = context.args
     if not args or args[0].lower() not in ("on", "off"):
         status = "✅ activas" if chat_id in subscribed_chats else "❌ inactivas"
-        await update.message.reply_text(f"🐋 Alertas (>${WHALE_THRESHOLD:,}): {status}\n\n/alerts on\n/alerts off")
+        await update.message.reply_text(
+            f"🐋 Alertas (ballenas + volumen inusual):\nEstado: {status}\n\n"
+            f"/alerts on\n/alerts off"
+        )
         return
     if args[0].lower() == "on":
         subscribed_chats.add(chat_id)
-        await update.message.reply_text(f"🐋 Alertas activadas ( > ${WHALE_THRESHOLD:,} )")
+        await update.message.reply_text(
+            f"🐋 Alertas activadas\n\n"
+            f"• Ballenas > ${WHALE_THRESHOLD:,}\n"
+            f"• Volumen inusual (≥ {VOLUME_MULTIPLIER}x promedio)"
+        )
     else:
         subscribed_chats.discard(chat_id)
         await update.message.reply_text("🔕 Alertas desactivadas.")
@@ -308,8 +377,8 @@ async def help_command(update, context):
     await update.message.reply_text(
         "🐂 *BlackBullRadar*\n\n"
         "/price → Vista rápida\n"
-        "/stats → Stats detalladas\n"
-        f"/alerts on → Ballenas > ${WHALE_THRESHOLD:,}\n"
+        "/stats → Stats detalladas + ratio compras/ventas\n"
+        f"/alerts on → Ballenas + Volumen inusual\n"
         "/alerts off → Desactivar\n"
         "/help → Ayuda",
         parse_mode="Markdown"
